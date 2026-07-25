@@ -1,0 +1,53 @@
+# -------------------------------------------------------
+# YouDub Backend - CPU only (no NVIDIA GPU required)
+# WARNING: Whisper, Demucs and VoxCPM are extremely slow on CPU.
+# Build:  docker build -f Dockerfile.backend.cpu -t youdub-backend-cpu .
+# -------------------------------------------------------
+FROM python:3.12-slim
+
+# Switch APT to Aliyun mirror for China network, then install ffmpeg + build tools
+# (build-essential/python3-dev for diffq)
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        build-essential \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1. CPU-only PyTorch + torchcodec CPU variant (avoids libnvrtc/libc10_cuda dependency)
+RUN pip install --no-cache-dir \
+    torch \
+    torchaudio \
+    torchcodec \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Main project requirements
+COPY requirements.txt ./
+RUN pip install --no-cache-dir \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    -r requirements.txt
+
+# 3. Demucs source submodule (--no-deps to avoid torchaudio<2.1 cap)
+COPY submodule/demucs ./submodule/demucs
+RUN pip install --no-cache-dir --no-deps \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    ./submodule/demucs \
+    && pip install --no-cache-dir \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    einops pyyaml tqdm
+
+# 4. Application code
+COPY backend ./backend
+COPY .env.example ./
+RUN mkdir -p data/cookies data/logs data/modelscope workfolder
+
+ENV PYTHONPATH=/app \
+    DEVICE=cpu
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

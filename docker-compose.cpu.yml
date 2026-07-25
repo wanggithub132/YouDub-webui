@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------
+# CPU 模式覆盖：替换后端镜像，移除 GPU 预留
+# 用法:  docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+# ---------------------------------------------------------------
+
+services:
+  backend:
+    build:
+      dockerfile: Dockerfile.backend.cpu
+    environment:
+      DEVICE: cpu
+    deploy:
+      resources:
+        reservations:
+          devices: []   # 显式清空 GPU 设备列表

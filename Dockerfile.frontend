@@ -1,0 +1,37 @@
+# -------------------------------------------------------
+# YouDub Frontend - Next.js 16 standalone
+# Build:  docker build -f Dockerfile.frontend -t youdub-frontend .
+# -------------------------------------------------------
+
+# ---- Build stage ----
+FROM node:20-slim AS build
+WORKDIR /app
+
+COPY apps/web/package.json apps/web/package-lock.json apps/web/.npmrc ./
+RUN npm ci --ignore-scripts
+
+COPY apps/web/ ./
+# standalone output keeps only the server + needed node_modules
+# NEXT_SERVER_API_BASE_URL must be set at BUILD time for Next.js rewrites
+ENV NEXT_PRIVATE_STANDALONE=true \
+    NEXT_SERVER_API_BASE_URL=http://backend:8000
+RUN npm run build
+
+# ---- Production stage ----
+FROM node:20-slim
+WORKDIR /app
+
+# Next.js standalone server (includes minimal node_modules)
+COPY --from=build /app/.next/standalone ./
+# Static assets must be in both locations for Next.js to serve them
+COPY --from=build /app/.next/static ./.next/static
+COPY --from=build /app/public ./public
+
+# Next.js rewrites /api/* to the backend container via Docker DNS
+ENV NEXT_SERVER_API_BASE_URL=http://backend:8000 \
+    HOSTNAME=0.0.0.0 \
+    PORT=3000
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]

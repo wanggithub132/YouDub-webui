@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------
+# YouDub WebUI - Docker Compose (CPU 模式，无 NVIDIA GPU)
+#
+# 用法:  docker compose -f docker-compose.cpu-only.yml up --build
+# 注意:  Whisper/Demucs/VoxCPM 在 CPU 上极慢，仅用于测试
+# ---------------------------------------------------------------
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend.cpu
+    env_file:
+      - .env
+    environment:
+      DEVICE: cpu
+    volumes:
+      - ./data:/app/data
+      - ./workfolder:/app/workfolder
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=10)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    environment:
+      NEXT_SERVER_API_BASE_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

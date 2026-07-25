@@ -1,0 +1,25 @@
+# Build context exclusions
+.git
+__pycache__
+*.pyc
+.env
+data
+workfolder
+node_modules
+
+# Frontend build artifacts (rebuilt in Dockerfile.frontend)
+apps/web/node_modules
+apps/web/.next
+apps/web/out
+
+# Submodule .git (not needed for pip install)
+submodule/demucs/.git
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+
+# OS files
+Thumbs.db
+.DS_Store
