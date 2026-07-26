@@ -18,6 +18,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # T4 不支持 bfloat16 编译，回退 eager 模式
+    import torch._dynamo  # noqa: E402
+    torch._dynamo.config.suppress_errors = True
+
     args = parse_args()
     database.init_db()
     task_id = args.task_id or database.create_task(args.url.strip())
