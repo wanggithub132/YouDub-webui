@@ -1,0 +1,44 @@
+name: Kaggle GPU 自动测试
+
+on:
+  # 手动触发（最常用）— 可填视频链接，也可留空跑单元测试
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "YouTube/Bilibili 视频链接（留空则跑单元测试）"
+        required: false
+        default: ""
+
+jobs:
+  kaggle-ci:
+    name: 在 Kaggle 免费 GPU 上执行
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ── 关键步骤：把视频链接写入 runner 脚本 ──
+      - name: 写入视频链接到 runner 脚本
+        run: |
+          URL="${{ github.event.inputs.video_url || '' }}"
+          sed -i "s|__VIDEO_URL__|$URL|g" .github/script/gpu_runner.py
+
+      - name: 提交到 Kaggle GPU 执行
+        uses: Frederisk/kaggle-action@v2
+        with:
+          # 用你拿到的 KGAT_ 开头的新版 Token（已在 GitHub Secrets 中配置）
+          api_token: ${{ secrets.KAGGLE_API_TOKEN }}
+
+          # 任务标题（不要用下划线、空格）
+          title: YouDub-GPU-Run
+
+          # 要执行的脚本
+          code_file: .github/script/gpu_runner.py
+
+          # 启用 GPU
+          enable_gpu: enable
+          # 启用网络（下载依赖和模型需要）
+          enable_internet: enable
+          # 私有 kernel
+          is_private: true
