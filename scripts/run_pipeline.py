@@ -18,9 +18,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    # T4 不支持 bfloat16 编译，回退 eager 模式
+    # T4 不支持 bfloat16 原生编译，完全禁用 torch.compile
     import torch._dynamo  # noqa: E402
     torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.disable = True
 
     args = parse_args()
     database.init_db()
