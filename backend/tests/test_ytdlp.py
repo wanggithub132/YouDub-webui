@@ -59,6 +59,22 @@ def test_ytdlp_enables_node_js_runtime(tmp_path):
     assert options["js_runtimes"] == {"node": {}}
 
 
+def test_ytdlp_youtube_uses_player_client_without_custom_user_agent():
+    options = ytdlp._ydl_base(_youtube_source(), "")
+
+    assert options["extractor_args"] == {"youtube": {"player_client": ["android", "web"]}}
+    assert "http_headers" not in options
+
+
+def test_ytdlp_non_youtube_keeps_custom_user_agent(tmp_path):
+    source = _make_source(use_proxy=False, cookie_dir=tmp_path)
+
+    options = ytdlp._ydl_base(source, "")
+
+    assert options["http_headers"] == {"User-Agent": ytdlp.DEFAULT_USER_AGENT}
+    assert "extractor_args" not in options
+
+
 def test_ytdlp_format_candidates_start_with_backend_format():
     assert ytdlp.FORMAT_CANDIDATES[0] == "bestvideo[height<=1080]+bestaudio/best"
     assert "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" not in ytdlp.FORMAT_CANDIDATES

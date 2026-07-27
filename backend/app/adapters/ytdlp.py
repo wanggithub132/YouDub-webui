@@ -67,8 +67,13 @@ def _ydl_base(source: SourceConfig, proxy_port: str = "") -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "js_runtimes": {"node": {}},
-        "http_headers": {"User-Agent": DEFAULT_USER_AGENT},
     }
+    if source.name == "youtube":
+        # yt-dlp 官方警告：对 YouTube 覆盖 User-Agent 会导致格式失效；
+        # 登录 cookie 会触发 SABR-only 响应，加 android 客户端兜底
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+    else:
+        opts["http_headers"] = {"User-Agent": DEFAULT_USER_AGENT}
     cookie_path = source.cookie_path
     if cookie_path:
         metadata = runtime_security.private_file_stat(cookie_path)
