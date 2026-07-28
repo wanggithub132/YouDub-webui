@@ -1,21 +1,35 @@
-name: YouDub Kaggle GPU
+name: YouDub Kaggle GPU (批量)
 
 on:
-  # 手动触发：填入要处理的视频链接
+  # 手动触发：可覆盖单条链接 / 批量大小
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube/Bilibili 视频链接"
-        required: true
+        description: "单条视频链接（留空则用 Google 表格批量）"
+        required: false
+        default: ""
+      batch_size:
+        description: "每批处理几个视频"
+        required: false
+        default: "6"
+  # 定时滴灌：每 6 小时自动跑一批表格里没跑过的（UTC）
+  schedule:
+    - cron: "0 */6 * * *"
+
+concurrency:
+  # 同一时间只允许一个批次在跑，避免撞 Kaggle GPU 并发/配额
+  group: youdub-kaggle-gpu
+  cancel-in-progress: false
 
 jobs:
   kaggle-gpu:
-    name: 在 Kaggle T4 上跑 YouDub pipeline
+    name: 在 Kaggle T4 上批量跑 YouDub pipeline
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 355
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      OUTPUTS_SLUG: ${{ secrets.KAGGLE_USERNAME }}/youdub-outputs
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -23,9 +37,31 @@ jobs:
       - name: 安装 Kaggle CLI
         run: pip install -q kaggle
 
-      - name: 组装 kernel（注入链接/密钥/cookie + 元数据）
+      - name: 确保产物数据集存在（去重依据 + 产物归档）
+        run: |
+          set -uo pipefail
+          if kaggle datasets status "$OUTPUTS_SLUG" 2>/dev/null | grep -qi ready; then
+            echo "产物数据集已存在"
+          else
+            echo "首次运行：创建空的产物数据集 $OUTPUTS_SLUG"
+            rm -rf outds && mkdir -p outds
+            echo "YouDub 产物归档（每个视频一个 {vid}.zip）" > outds/README.txt
+            python3 - <<EOF
+          import json, os, pathlib
+          user = os.environ["KAGGLE_USERNAME"]
+          meta = {"title": "youdub-outputs", "id": f"{user}/youdub-outputs",
+                  "licenses": [{"name": "CC0-1.0"}]}
+          pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
+          EOF
+            kaggle datasets create -p outds --dir-mode zip || true
+            sleep 15
+          fi
+
+      - name: 组装 kernel（注入表格/密钥/cookie + 挂载两个数据集）
         env:
           INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
+          INPUT_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YOUTUBE_COOKIE: ${{ secrets.YOUTUBE_COOKIE }}
         run: |
@@ -36,8 +72,10 @@ jobs:
 
           p = pathlib.Path("kernel/gpu_runner.py")
           s = p.read_text()
-          s = s.replace("__VIDEO_URL__", os.environ["INPUT_VIDEO_URL"].strip())
+          s = s.replace("__VIDEO_URL__", os.environ.get("INPUT_VIDEO_URL", "").strip())
+          s = s.replace("__SHEET_CSV_URL__", os.environ.get("SHEET_CSV_URL", "").strip())
           s = s.replace("__OPENAI_API_KEY__", os.environ["OPENAI_API_KEY"].strip())
+          s = s.replace("__BATCH_SIZE__", (os.environ.get("INPUT_BATCH_SIZE") or "6").strip())
           cookie = os.environ.get("YOUTUBE_COOKIE", "")
           s = s.replace("__YOUTUBE_COOKIE_B64__",
                         base64.b64encode(cookie.encode()).decode())
@@ -53,8 +91,8 @@ jobs:
               "is_private": True,
               "enable_gpu": True,
               "enable_internet": True,
-              # 关键：API 推送时自动挂载模型缓存数据集
-              "dataset_sources": [f"{user}/youdub-models"],
+              # 关键：挂载模型缓存 + 产物数据集（产物用于去重）
+              "dataset_sources": [f"{user}/youdub-models", f"{user}/youdub-outputs"],
               "competition_sources": [],
               "kernel_sources": [],
           }
@@ -71,8 +109,8 @@ jobs:
             echo "===== 第 $attempt/$MAX_ATTEMPTS 次推送 ====="
             kaggle kernels push -p kernel
 
-            # 轮询直到 complete/error（最长约 4.5 小时）
-            for i in $(seq 1 270); do
+            # 轮询直到 complete/error（最长约 5.3 小时，留余量给下载/归档）
+            for i in $(seq 1 320); do
               sleep 60
               STATUS=$(kaggle kernels status "$SLUG" 2>&1 || true)
               echo "[$i min] $STATUS"
@@ -87,12 +125,9 @@ jobs:
             echo "本次结果: $RESULT"
 
             if [ "$RESULT" = "SUCCESS" ]; then
-              echo "✅ 成功，产物已下载到 out/"
-              ls -lh out/
-              exit 0
+              echo "✅ 成功"; ls -lh out/; exit 0
             elif [ "$RESULT" = "GPU_NOT_T4" ]; then
-              echo "🎲 分到非 T4 GPU，重新推送抽卡..."
-              continue
+              echo "🎲 分到非 T4 GPU，重新推送抽卡..."; continue
             else
               echo "❌ 失败: $RESULT"
               echo "--- kernel 日志尾部 ---"
@@ -101,16 +136,39 @@ jobs:
             fi
           done
 
-          echo "❌ 连续 $MAX_ATTEMPTS 次未抽到 T4，放弃（可稍后重新触发）"
+          echo "❌ 连续 $MAX_ATTEMPTS 次未抽到 T4，放弃（下次定时会自动重试）"
           exit 1
 
-      - name: 上传成品为 Artifact
+      - name: 归档产物到数据集（供下次去重 + 长期留存）
+        if: success()
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          NEW_ZIPS=(out/*.zip)
+          if [ ${#NEW_ZIPS[@]} -eq 0 ]; then
+            echo "本批无新产物（可能已全部处理过），跳过归档"; exit 0
+          fi
+          rm -rf outds && mkdir -p outds
+          kaggle datasets download "$OUTPUTS_SLUG" -p outds --unzip || true
+          rm -f outds/dataset-metadata.json
+          cp out/*.zip outds/ || true
+          python3 - <<EOF
+          import json, os, pathlib
+          user = os.environ["KAGGLE_USERNAME"]
+          meta = {"title": "youdub-outputs", "id": f"{user}/youdub-outputs",
+                  "licenses": [{"name": "CC0-1.0"}]}
+          pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
+          EOF
+          kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip
+
+      - name: 上传成品为 Artifact（本次批次）
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: youdub-output
           path: out/*.zip
           retention-days: 14
+          if-no-files-found: ignore
 
       - name: 上传日志（失败时排查用）
         if: failure()
