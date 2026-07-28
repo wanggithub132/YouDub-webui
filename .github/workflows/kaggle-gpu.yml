@@ -1,44 +1,122 @@
-name: Kaggle GPU 自动测试
+name: YouDub Kaggle GPU
 
 on:
-  # 手动触发（最常用）— 可填视频链接，也可留空跑单元测试
+  # 手动触发：填入要处理的视频链接
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube/Bilibili 视频链接（留空则跑单元测试）"
-        required: false
-        default: ""
+        description: "YouTube/Bilibili 视频链接"
+        required: true
 
 jobs:
-  kaggle-ci:
-    name: 在 Kaggle 免费 GPU 上执行
+  kaggle-gpu:
+    name: 在 Kaggle T4 上跑 YouDub pipeline
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 350
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # ── 关键步骤：把视频链接写入 runner 脚本 ──
-      - name: 写入视频链接到 runner 脚本
+      - name: 安装 Kaggle CLI
+        run: pip install -q kaggle
+
+      - name: 组装 kernel（注入链接/密钥/cookie + 元数据）
+        env:
+          INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          YOUTUBE_COOKIE: ${{ secrets.YOUTUBE_COOKIE }}
         run: |
-          URL="${{ github.event.inputs.video_url || '' }}"
-          sed -i "s|__VIDEO_URL__|$URL|g" .github/script/gpu_runner.py
+          mkdir -p kernel
+          cp .github/script/gpu_runner.py kernel/gpu_runner.py
+          python3 - <<'EOF'
+          import base64, json, os, pathlib
 
-      - name: 提交到 Kaggle GPU 执行
-        uses: Frederisk/kaggle-action@v2
+          p = pathlib.Path("kernel/gpu_runner.py")
+          s = p.read_text()
+          s = s.replace("__VIDEO_URL__", os.environ["INPUT_VIDEO_URL"].strip())
+          s = s.replace("__OPENAI_API_KEY__", os.environ["OPENAI_API_KEY"].strip())
+          cookie = os.environ.get("YOUTUBE_COOKIE", "")
+          s = s.replace("__YOUTUBE_COOKIE_B64__",
+                        base64.b64encode(cookie.encode()).decode())
+          p.write_text(s)
+
+          user = os.environ["KAGGLE_USERNAME"]
+          meta = {
+              "id": f"{user}/youdub-gpu-run",
+              "title": "youdub-gpu-run",
+              "code_file": "gpu_runner.py",
+              "language": "python",
+              "kernel_type": "script",
+              "is_private": True,
+              "enable_gpu": True,
+              "enable_internet": True,
+              # 关键：API 推送时自动挂载模型缓存数据集
+              "dataset_sources": [f"{user}/youdub-models"],
+              "competition_sources": [],
+              "kernel_sources": [],
+          }
+          pathlib.Path("kernel/kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+          EOF
+
+      - name: 推送并等待（非 T4 自动重推，最多 4 次）
+        run: |
+          set -uo pipefail
+          SLUG="$KAGGLE_USERNAME/youdub-gpu-run"
+          MAX_ATTEMPTS=4
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "===== 第 $attempt/$MAX_ATTEMPTS 次推送 ====="
+            kaggle kernels push -p kernel
+
+            # 轮询直到 complete/error（最长约 4.5 小时）
+            for i in $(seq 1 270); do
+              sleep 60
+              STATUS=$(kaggle kernels status "$SLUG" 2>&1 || true)
+              echo "[$i min] $STATUS"
+              case "$STATUS" in
+                *'"complete"'*|*'"error"'*|*cancel*) break ;;
+              esac
+            done
+
+            rm -rf out && mkdir -p out
+            kaggle kernels output "$SLUG" -p out || true
+            RESULT=$(head -1 out/RESULT.txt 2>/dev/null || echo "NO_RESULT")
+            echo "本次结果: $RESULT"
+
+            if [ "$RESULT" = "SUCCESS" ]; then
+              echo "✅ 成功，产物已下载到 out/"
+              ls -lh out/
+              exit 0
+            elif [ "$RESULT" = "GPU_NOT_T4" ]; then
+              echo "🎲 分到非 T4 GPU，重新推送抽卡..."
+              continue
+            else
+              echo "❌ 失败: $RESULT"
+              echo "--- kernel 日志尾部 ---"
+              tail -200 out/*.log 2>/dev/null || true
+              exit 1
+            fi
+          done
+
+          echo "❌ 连续 $MAX_ATTEMPTS 次未抽到 T4，放弃（可稍后重新触发）"
+          exit 1
+
+      - name: 上传成品为 Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
-          # 用你拿到的 KGAT_ 开头的新版 Token（已在 GitHub Secrets 中配置）
-          api_token: ${{ secrets.KAGGLE_API_TOKEN }}
+          name: youdub-output
+          path: out/*.zip
+          retention-days: 14
 
-          # 任务标题（不要用下划线、空格）
-          title: YouDub-GPU-Run
-
-          # 要执行的脚本
-          code_file: .github/script/gpu_runner.py
-
-          # 启用 GPU
-          enable_gpu: enable
-          # 启用网络（下载依赖和模型需要）
-          enable_internet: enable
-          # 私有 kernel
-          is_private: true
+      - name: 上传日志（失败时排查用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youdub-debug-log
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
