@@ -90,6 +90,8 @@ jobs:
               "kernel_type": "script",
               "is_private": True,
               "enable_gpu": True,
+              # 锁定 T4 加速器，避免抽到 P100（抽卡重试仍保留作兜底）
+              "machine_shape": "NvidiaTeslaT4",
               "enable_internet": True,
               # 关键：挂载模型缓存 + 产物数据集（产物用于去重）
               "dataset_sources": [f"{user}/youdub-models", f"{user}/youdub-outputs"],
@@ -107,7 +109,8 @@ jobs:
 
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
             echo "===== 第 $attempt/$MAX_ATTEMPTS 次推送 ====="
-            kaggle kernels push -p kernel
+            # --timeout: kernel 硬超时 5.5h，防止 Actions 走后 kernel 继续空烧 GPU 配额
+            kaggle kernels push -p kernel --timeout 19800
 
             # 轮询直到 complete/error（最长约 5.3 小时，留余量给下载/归档）
             for i in $(seq 1 320); do
@@ -159,7 +162,7 @@ jobs:
                   "licenses": [{"name": "CC0-1.0"}]}
           pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
           EOF
-          kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip
+          kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip --delete-old-versions
 
       - name: 上传成品为 Artifact（本次批次）
         if: success()

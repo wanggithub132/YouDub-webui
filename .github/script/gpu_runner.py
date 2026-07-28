@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -245,8 +246,17 @@ def main() -> int:
     env["TORCHDYNAMO_DISABLE"] = "1"  # T4 不支持 bfloat16 编译
     env["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-    ok, fail, produced = [], [], []
+    # 软截止：开跑 4h40m 后不再接新视频，留时间收尾打包
+    # （Actions 轮询 5.3h / kernel 硬超时 5.5h，硬杀会丢掉已完成的产物）
+    deadline = time.monotonic() + 4 * 3600 + 40 * 60
+
+    ok, fail, skipped = [], [], []
+    produced = []
     for url, vid in todo:
+        if time.monotonic() > deadline:
+            skipped.append(vid)
+            print(f"⏰ 时间预算已用尽，跳过: {vid}（下次定时会自动补跑）", flush=True)
+            continue
         try:
             rc = run_one(url, env)
         except Exception as exc:  # 单个视频崩溃不影响后续
@@ -257,6 +267,8 @@ def main() -> int:
 
     # ── 9. 汇总结果 ──
     summary = f"成功 {len(ok)} [{', '.join(ok)}] / 失败 {len(fail)} [{', '.join(fail)}]"
+    if skipped:
+        summary += f" / 超时顺延 {len(skipped)} [{', '.join(skipped)}]"
     print("\n" + summary, flush=True)
     if produced and not fail:
         write_result("SUCCESS", summary)
