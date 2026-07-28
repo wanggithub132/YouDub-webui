@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Callable
 
 import soundfile as sf
 from pydub import AudioSegment
 
-from ..config import MODEL_CACHE_DIR
+from ..config import MODEL_CACHE_DIR, REPO_ROOT
 
 _MODEL = None
 
@@ -93,11 +96,76 @@ def _tts_text(item: dict) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _multi_gpu_devices() -> list[str]:
+    raw = os.getenv("VOXCPM_GPU_DEVICES")
+    if raw is not None:
+        # explicit override: "0,1" forces sharding, "" or a single id disables it
+        devices = [d.strip() for d in raw.split(",") if d.strip()]
+        return devices if len(devices) >= 2 else []
+    try:
+        import torch
+    except ImportError:
+        return []
+    if not torch.cuda.is_available():
+        return []
+    count = torch.cuda.device_count()
+    return [str(i) for i in range(count)] if count >= 2 else []
+
+
+def _pending_count(total: int, output_dir: Path) -> int:
+    return sum(
+        1
+        for index in range(1, total + 1)
+        if not (output_dir / f"{index:04d}.wav").exists()
+    )
+
+
+def _run_shard_workers(
+    devices: list[str],
+    translation_file: Path,
+    vocals_dir: Path,
+    session: Path,
+    output_dir: Path,
+    total: int,
+    progress_callback: Callable[[int, str], None] | None,
+) -> None:
+    num_shards = len(devices)
+    procs = []
+    for shard, device in enumerate(devices):
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = device
+        env["VOXCPM_GPU_DEVICES"] = ""  # workers must take the single-GPU path
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable, "-m", "backend.app.adapters.voxcpm",
+                    str(translation_file), str(vocals_dir), str(session),
+                    "--shard", str(shard), "--num-shards", str(num_shards),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+            )
+        )
+    while any(proc.poll() is None for proc in procs):
+        if progress_callback:
+            done = total - _pending_count(total, output_dir)
+            progress = min(round(done / total * 100), 99)
+            progress_callback(progress, f"Prepared {done}/{total} TTS clips (multi-GPU)")
+        time.sleep(5)
+    for shard, proc in enumerate(procs):
+        if proc.wait() != 0:
+            print(f"VoxCPM shard worker {shard} exited with {proc.returncode}; "
+                  "missing clips will be regenerated in-process", flush=True)
+
+
 def generate_tts(
     translation_file: Path,
     vocals_dir: Path,
     session: Path,
     progress_callback: Callable[[int, str], None] | None = None,
+    *,
+    shard: int = 0,
+    num_shards: int = 1,
 ) -> Path:
     output_dir = session / "segments" / "tts"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,17 +177,29 @@ def generate_tts(
             progress_callback(100, "No TTS clips to generate")
         return output_dir
 
-    model = _load_model()
+    devices = _multi_gpu_devices()
+    min_items = int(os.getenv("VOXCPM_MULTI_GPU_MIN_ITEMS", "8"))
+    if num_shards == 1 and devices and _pending_count(total, output_dir) >= min_items:
+        _run_shard_workers(
+            devices, translation_file, vocals_dir, session, output_dir, total, progress_callback
+        )
+        # fall through: the sweep below regenerates any clips a worker failed to produce
+
     min_reference_ms = int(os.getenv("VOXCPM_MIN_REFERENCE_MS", "1200"))
     fallback_references, global_fallback = _fallback_references(vocals_dir, items, min_reference_ms)
     cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))
     inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
 
+    model = None
     fallback_caches = {}
 
     for index, item in enumerate(items, start=1):
+        if (index - 1) % num_shards != shard:
+            continue
         output_file = output_dir / f"{index:04d}.wav"
         if not output_file.exists():
+            if model is None:
+                model = _load_model()
             reference = vocals_dir / f"{index:04d}.wav"
             text = _tts_text(item)
             if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
@@ -151,3 +231,26 @@ def generate_tts(
             progress_callback(progress, f"Prepared {index}/{total} TTS clips")
 
     return output_dir
+
+
+def _main(argv: list[str]) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="VoxCPM TTS shard worker")
+    parser.add_argument("translation_file")
+    parser.add_argument("vocals_dir")
+    parser.add_argument("session")
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    args = parser.parse_args(argv)
+    generate_tts(
+        Path(args.translation_file),
+        Path(args.vocals_dir),
+        Path(args.session),
+        shard=args.shard,
+        num_shards=args.num_shards,
+    )
+
+
+if __name__ == "__main__":
+    _main(sys.argv[1:])
