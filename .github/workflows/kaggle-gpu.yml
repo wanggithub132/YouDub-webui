@@ -1,7 +1,7 @@
 name: YouDub Kaggle GPU (批量)
 
 on:
-  # 手动触发：可覆盖单条链接 / 批量大小
+  # 仅手动触发：Actions 页 Run workflow（可覆盖单条链接 / 批量大小）
   workflow_dispatch:
     inputs:
       video_url:
@@ -12,9 +12,6 @@ on:
         description: "每批处理几个视频"
         required: false
         default: "6"
-  # 定时滴灌：每 6 小时自动跑一批表格里没跑过的（UTC）
-  schedule:
-    - cron: "0 */6 * * *"
 
 concurrency:
   # 同一时间只允许一个批次在跑，避免撞 Kaggle GPU 并发/配额
