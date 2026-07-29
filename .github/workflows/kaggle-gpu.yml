@@ -28,6 +28,36 @@ jobs:
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
       OUTPUTS_SLUG: ${{ secrets.KAGGLE_USERNAME }}/youdub-outputs
     steps:
+      - name: 参数验证（缺必填配置立即失败）
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          YOUTUBE_COOKIE: ${{ secrets.YOUTUBE_COOKIE }}
+          SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
+          INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
+        run: |
+          set -uo pipefail
+          MISSING=""
+          [ -z "${KAGGLE_USERNAME:-}" ] && MISSING="$MISSING KAGGLE_USERNAME(Secret)"
+          [ -z "${KAGGLE_KEY:-}" ] && MISSING="$MISSING KAGGLE_KEY(Secret)"
+          [ -z "${OPENAI_API_KEY:-}" ] && MISSING="$MISSING OPENAI_API_KEY(Secret)"
+          [ -z "${YOUTUBE_COOKIE:-}" ] && MISSING="$MISSING YOUTUBE_COOKIE(Secret)"
+          if [ -n "$MISSING" ]; then
+            echo "❌ 缺少必填配置:$MISSING"
+            echo "   请到 仓库 Settings → Secrets and variables → Actions → Secrets 补齐（名字须一字不差）"
+            exit 1
+          fi
+          if [ -z "${INPUT_VIDEO_URL:-}" ] && [ -z "${SHEET_CSV_URL:-}" ]; then
+            echo "❌ 视频来源为空：既没填 video_url 输入，也没配 SHEET_CSV_URL 变量"
+            echo "   二选一：Run workflow 时填单条链接，或到 Settings → Secrets and variables → Actions → Variables 配 SHEET_CSV_URL"
+            exit 1
+          fi
+          # 软检查：cookie 应为 Netscape 格式，不对只提醒不阻断
+          case "$YOUTUBE_COOKIE" in
+            '# Netscape'*|'# HTTP Cookie'*) : ;;
+            *) echo "⚠️ YOUTUBE_COOKIE 首行不是 '# Netscape HTTP Cookie File'，可能不是导出的 cookies.txt 全文，请确认" ;;
+          esac
+          echo "✅ 参数验证通过"
+
       - name: 检出代码
         uses: actions/checkout@v4
 
@@ -110,12 +140,14 @@ jobs:
             kaggle kernels push -p kernel --timeout 19800
 
             # 轮询直到 complete/error（最长约 5.3 小时，留余量给下载/归档）
+            # 状态统一转小写再匹配：新版 CLI 输出格式/大小写不固定（如 KernelWorkerStatus.ERROR）
             for i in $(seq 1 320); do
               sleep 60
               STATUS=$(kaggle kernels status "$SLUG" 2>&1 || true)
               echo "[$i min] $STATUS"
-              case "$STATUS" in
-                *'"complete"'*|*'"error"'*|*cancel*) break ;;
+              LOWER=$(printf '%s' "$STATUS" | tr '[:upper:]' '[:lower:]')
+              case "$LOWER" in
+                *complete*|*error*|*cancel*) break ;;
               esac
             done
 
