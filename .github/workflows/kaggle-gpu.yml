@@ -193,15 +193,6 @@ jobs:
           EOF
           kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip --delete-old-versions
 
-      - name: 上传成品为 Artifact（本次批次）
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: youdub-output
-          path: out/*.zip
-          retention-days: 14
-          if-no-files-found: ignore
-
       - name: 上传日志（失败时排查用）
         if: failure()
         uses: actions/upload-artifact@v4
