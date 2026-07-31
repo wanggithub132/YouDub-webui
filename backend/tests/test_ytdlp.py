@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -122,8 +123,9 @@ def test_download_video_passes_only_the_canonical_url_to_both_ytdlp_sinks(
 
         def download(self, urls):
             downloaded_urls.extend(urls)
-            Path(self.options["outtmpl"]).write_bytes(b"video")
+            Path(self.options["outtmpl"]).write_bytes(b"v" * ytdlp.MIN_VIDEO_SIZE_BYTES)
 
+    monkeypatch.setattr(ytdlp, "_probe_duration", lambda path: 120.0)
     monkeypatch.setattr(ytdlp.yt_dlp, "YoutubeDL", FakeYoutubeDL)
 
     session, _ = ytdlp.download_video(
@@ -135,7 +137,112 @@ def test_download_video_passes_only_the_canonical_url_to_both_ytdlp_sinks(
     expected = "https://www.youtube.com/watch?v=abcdefghijk"
     assert extracted_urls == [expected]
     assert downloaded_urls == [expected]
-    assert (session / "media" / "video_source.mp4").read_bytes() == b"video"
+    assert (
+        (session / "media" / "video_source.mp4").read_bytes()
+        == b"v" * ytdlp.MIN_VIDEO_SIZE_BYTES
+    )
+
+
+def _fake_download_ytdlp(written_bytes: bytes):
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def extract_info(self, url, *, download):
+            return {
+                "id": "abcdefghijk",
+                "uploader": "tester",
+                "title": "canonical",
+                "webpage_url": url,
+            }
+
+        def sanitize_info(self, info):
+            return info
+
+        def download(self, urls):
+            Path(self.options["outtmpl"]).write_bytes(written_bytes)
+
+    return FakeYoutubeDL
+
+
+def test_download_video_rejects_truncated_download(monkeypatch, tmp_path):
+    # 模拟 yt-dlp "假成功"：只写出 32KB 的残缺文件
+    monkeypatch.setattr(
+        ytdlp.yt_dlp, "YoutubeDL", _fake_download_ytdlp(b"x" * (32 * 1024))
+    )
+
+    with pytest.raises(RuntimeError, match="invalid or truncated"):
+        ytdlp.download_video(
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            tmp_path,
+            _youtube_source(),
+        )
+
+    video_file = tmp_path / "tester" / "canonical__abcdefghijk" / "media" / "video_source.mp4"
+    assert not video_file.exists()
+
+
+def test_download_video_rejects_too_short_duration(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        ytdlp.yt_dlp,
+        "YoutubeDL",
+        _fake_download_ytdlp(b"v" * ytdlp.MIN_VIDEO_SIZE_BYTES),
+    )
+    monkeypatch.setattr(ytdlp, "_probe_duration", lambda path: 3.0)
+
+    with pytest.raises(RuntimeError, match=r"3\.0 s"):
+        ytdlp.download_video(
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            tmp_path,
+            _youtube_source(),
+        )
+
+    video_file = tmp_path / "tester" / "canonical__abcdefghijk" / "media" / "video_source.mp4"
+    assert not video_file.exists()
+
+
+def test_download_video_replaces_invalid_cached_file(monkeypatch, tmp_path):
+    # 预置上次失败残留的 32KB 残缺缓存文件
+    video_file = tmp_path / "tester" / "canonical__abcdefghijk" / "media" / "video_source.mp4"
+    video_file.parent.mkdir(parents=True)
+    video_file.write_bytes(b"x" * (32 * 1024))
+
+    monkeypatch.setattr(
+        ytdlp.yt_dlp,
+        "YoutubeDL",
+        _fake_download_ytdlp(b"v" * ytdlp.MIN_VIDEO_SIZE_BYTES),
+    )
+    monkeypatch.setattr(ytdlp, "_probe_duration", lambda path: 120.0)
+
+    session, _ = ytdlp.download_video(
+        "https://www.youtube.com/watch?v=abcdefghijk",
+        tmp_path,
+        _youtube_source(),
+    )
+
+    assert (session / "media" / "video_source.mp4").read_bytes() == b"v" * ytdlp.MIN_VIDEO_SIZE_BYTES
+
+
+def test_probe_duration_uses_configured_ffprobe(monkeypatch):
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=False, text=False, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="123.456\n", stderr="")
+
+    monkeypatch.setenv("FFPROBE_PATH", "/opt/bin/ffprobe")
+    monkeypatch.setattr(ytdlp.subprocess, "run", fake_run)
+
+    assert ytdlp._probe_duration(Path("video.mp4")) == 123.456
+    assert commands[0][0] == "/opt/bin/ffprobe"
+    assert "-show_entries" in commands[0]
+    assert "format=duration" in commands[0]
 
 
 def test_download_video_rejects_deceptive_url_before_cookie_or_ytdlp(

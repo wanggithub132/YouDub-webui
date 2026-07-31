@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import requests
 import yt_dlp
 
 from .. import runtime_security
+from ..config import ffprobe_binary
 from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import extract_video_id, validate_video_url
@@ -22,6 +24,11 @@ FORMAT_CANDIDATES = (
     "bv*+ba/b",
     "best",
 )
+
+# 下载健全性阈值：低于该值视为残缺/截断文件，
+# 防止 yt-dlp "假成功"（仅写出几 KB 的错误页/空壳文件）进入后续阶段
+MIN_VIDEO_SIZE_BYTES = 512 * 1024
+MIN_VIDEO_DURATION_SECONDS = 10
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -107,6 +114,36 @@ def _remove_partial_outputs(video_file: Path) -> None:
             candidate.unlink(missing_ok=True)
 
 
+def _probe_duration(video_file: Path) -> float | None:
+    result = subprocess.run(
+        [
+            ffprobe_binary(),
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            str(video_file),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _is_valid_video(video_file: Path) -> bool:
+    if not video_file.exists() or video_file.stat().st_size < MIN_VIDEO_SIZE_BYTES:
+        return False
+    duration = _probe_duration(video_file)
+    return duration is not None and duration >= MIN_VIDEO_DURATION_SECONDS
+
+
 def _download_with_format_candidates(
     url: str, video_file: Path, source: SourceConfig, proxy_port: str
 ) -> None:
@@ -159,12 +196,24 @@ def download_video(
     metadata_file = metadata_dir / "ytdlp_info.json"
     metadata_file.write_text(json.dumps(ydl.sanitize_info(info), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if video_file.exists() and video_file.stat().st_size > 0:
+    if video_file.exists() and _is_valid_video(video_file):
         return session, info
+
+    # 缓存文件无效（残缺/时长过短）时删除后重新下载，避免旧残片"假成功"
+    video_file.unlink(missing_ok=True)
+    _remove_partial_outputs(video_file)
 
     _download_with_format_candidates(canonical_url, video_file, source, proxy_port)
 
-    if not video_file.exists() or video_file.stat().st_size == 0:
-        raise RuntimeError("yt-dlp finished without producing media/video_source.mp4")
+    if not _is_valid_video(video_file):
+        size = video_file.stat().st_size if video_file.exists() else 0
+        duration = _probe_duration(video_file) if video_file.exists() else None
+        _remove_partial_outputs(video_file)
+        video_file.unlink(missing_ok=True)
+        raise RuntimeError(
+            "yt-dlp produced an invalid or truncated video "
+            f"({size} bytes, {duration if duration is not None else 'unknown'} s); "
+            "partial outputs removed"
+        )
 
     return session, info
