@@ -1,38 +1,46 @@
-name: YouDub Kaggle GPU (批量)
+name: YouDub Kaggle GPU（单条认领）
 
 on:
-  # 仅手动触发：Actions 页 Run workflow（可覆盖单条链接 / 批量大小）
+  # 定时：每 6 小时消化一条表格任务（天然给 B站投稿限流）
+  schedule:
+    - cron: "0 */6 * * *"
+  # 手动：留空走表格认领；填单条链接则只处理不投稿（调试用，不动表格）
   workflow_dispatch:
     inputs:
       video_url:
-        description: "单条视频链接（留空则用 Google 表格批量）"
+        description: "单条视频链接（留空则从 Google 表格认领一条）"
         required: false
         default: ""
-      batch_size:
-        description: "每批处理几个视频"
-        required: false
-        default: "6"
 
 concurrency:
-  # 同一时间只允许一个批次在跑，避免撞 Kaggle GPU 并发/配额
+  # 同一时间只允许一个在跑：避免撞 Kaggle GPU 配额，也避免表格重复认领
   group: youdub-kaggle-gpu
   cancel-in-progress: false
 
+env:
+  BILI_UP_VER: v0.2.4
+
 jobs:
   kaggle-gpu:
-    name: 在 Kaggle T4 上批量跑 YouDub pipeline
+    name: 认领一条 → Kaggle 处理 → 投稿 B站
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
       OUTPUTS_SLUG: ${{ secrets.KAGGLE_USERNAME }}/youdub-outputs
+      GIST_ID: ${{ secrets.GIST_ID }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+      # Google 凭证只走 Secrets，绝不进 Gist（Google 会扫描 Gist 自动撤销私钥）
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      SHEET_ID: ${{ vars.SHEET_ID }}
+      # YouDub 专属工作表名（如「拳击零基础」），与 dapang 的「表格1」隔离，避免抢行
+      SHEET_TAB: ${{ vars.SHEET_TAB }}
     steps:
       - name: 参数验证（缺必填配置立即失败）
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YOUTUBE_COOKIE: ${{ secrets.YOUTUBE_COOKIE }}
-          SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
           INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
         run: |
           set -uo pipefail
@@ -41,30 +49,41 @@ jobs:
           [ -z "${KAGGLE_KEY:-}" ] && MISSING="$MISSING KAGGLE_KEY(Secret)"
           [ -z "${OPENAI_API_KEY:-}" ] && MISSING="$MISSING OPENAI_API_KEY(Secret)"
           [ -z "${YOUTUBE_COOKIE:-}" ] && MISSING="$MISSING YOUTUBE_COOKIE(Secret)"
+          # 表格认领模式才需要凭证/表格配置（手动单条调试可缺省）
+          if [ -z "${INPUT_VIDEO_URL:-}" ]; then
+            [ -z "${GOOGLE_CREDENTIALS:-}" ] && MISSING="$MISSING GOOGLE_CREDENTIALS(Secret)"
+            [ -z "${GIST_ID:-}" ] && MISSING="$MISSING GIST_ID(Secret)"
+            [ -z "${GIT_TOKEN:-}" ] && MISSING="$MISSING GIT_TOKEN(Secret)"
+            [ -z "${SHEET_ID:-}" ] && MISSING="$MISSING SHEET_ID(Variable)"
+            [ -z "${SHEET_TAB:-}" ] && MISSING="$MISSING SHEET_TAB(Variable)"
+          fi
           if [ -n "$MISSING" ]; then
             echo "❌ 缺少必填配置:$MISSING"
-            echo "   请到 仓库 Settings → Secrets and variables → Actions → Secrets 补齐（名字须一字不差）"
+            echo "   GOOGLE_CREDENTIALS = 服务账号 JSON 全文；Gist 内只需 cookie.json(YouDub专属B站账号, biliup login 产物)"
             exit 1
           fi
-          if [ -z "${INPUT_VIDEO_URL:-}" ] && [ -z "${SHEET_CSV_URL:-}" ]; then
-            echo "❌ 视频来源为空：既没填 video_url 输入，也没配 SHEET_CSV_URL 变量"
-            echo "   二选一：Run workflow 时填单条链接，或到 Settings → Secrets and variables → Actions → Variables 配 SHEET_CSV_URL"
-            exit 1
-          fi
-          # 软检查：cookie 应为 Netscape 格式，不对只提醒不阻断
           case "$YOUTUBE_COOKIE" in
             '# Netscape'*|'# HTTP Cookie'*) : ;;
             *) echo "⚠️ YOUTUBE_COOKIE 首行不是 '# Netscape HTTP Cookie File'，可能不是导出的 cookies.txt 全文，请确认" ;;
           esac
           echo "✅ 参数验证通过"
 
-      - name: 检出代码
+      - name: 检出代码（含 dapang submodule）
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
-      - name: 安装 Kaggle CLI
-        run: pip install -q kaggle
+      - name: 安装依赖（kaggle CLI + dapang 表格/Gist 能力所需）
+        run: pip install -q kaggle gspread oauth2client requests
+
+      - name: 从表格认领一条任务（读取即写「处理中」）
+        id: claim
+        env:
+          INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
+        run: python .github/script/sheet_task.py claim
 
       - name: 确保产物数据集存在（去重依据 + 产物归档）
+        if: steps.claim.outputs.has_video == 'true'
         run: |
           set -uo pipefail
           if kaggle datasets status "$OUTPUTS_SLUG" 2>/dev/null | grep -qi ready; then
@@ -84,11 +103,10 @@ jobs:
             sleep 15
           fi
 
-      - name: 组装 kernel（注入表格/密钥/cookie + 挂载两个数据集）
+      - name: 组装 kernel（注入单条链接/密钥/cookie + 挂载两个数据集）
+        if: steps.claim.outputs.has_video == 'true'
         env:
-          INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
-          INPUT_BATCH_SIZE: ${{ github.event.inputs.batch_size }}
-          SHEET_CSV_URL: ${{ vars.SHEET_CSV_URL }}
+          CLAIMED_VIDEO_URL: ${{ steps.claim.outputs.video_url }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           YOUTUBE_COOKIE: ${{ secrets.YOUTUBE_COOKIE }}
         run: |
@@ -99,10 +117,11 @@ jobs:
 
           p = pathlib.Path("kernel/gpu_runner.py")
           s = p.read_text()
-          s = s.replace("__VIDEO_URL__", os.environ.get("INPUT_VIDEO_URL", "").strip())
-          s = s.replace("__SHEET_CSV_URL__", os.environ.get("SHEET_CSV_URL", "").strip())
+          # 单条认领模式：只注入认领到的链接，表格 CSV 批量入口退役
+          s = s.replace("__VIDEO_URL__", os.environ["CLAIMED_VIDEO_URL"].strip())
+          s = s.replace("__SHEET_CSV_URL__", "")
+          s = s.replace("__BATCH_SIZE__", "1")
           s = s.replace("__OPENAI_API_KEY__", os.environ["OPENAI_API_KEY"].strip())
-          s = s.replace("__BATCH_SIZE__", (os.environ.get("INPUT_BATCH_SIZE") or "6").strip())
           cookie = os.environ.get("YOUTUBE_COOKIE", "")
           s = s.replace("__YOUTUBE_COOKIE_B64__",
                         base64.b64encode(cookie.encode()).decode())
@@ -129,6 +148,7 @@ jobs:
           EOF
 
       - name: 推送并等待（非 T4 自动重推，最多 4 次）
+        if: steps.claim.outputs.has_video == 'true'
         run: |
           set -uo pipefail
           SLUG="$KAGGLE_USERNAME/youdub-gpu-run"
@@ -172,13 +192,13 @@ jobs:
           exit 1
 
       - name: 归档产物到数据集（供下次去重 + 长期留存）
-        if: success()
+        if: success() && steps.claim.outputs.has_video == 'true'
         run: |
           set -uo pipefail
           shopt -s nullglob
           NEW_ZIPS=(out/*.zip)
           if [ ${#NEW_ZIPS[@]} -eq 0 ]; then
-            echo "本批无新产物（可能已全部处理过），跳过归档"; exit 0
+            echo "本次无新产物（可能此前已处理过），跳过归档"; exit 0
           fi
           rm -rf outds && mkdir -p outds
           kaggle datasets download "$OUTPUTS_SLUG" -p outds --unzip || true
@@ -192,6 +212,37 @@ jobs:
           pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
           EOF
           kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip --delete-old-versions
+
+      - name: 投稿到 B站（仅表格认领模式）
+        if: success() && steps.claim.outputs.claimed == 'true'
+        env:
+          VID: ${{ steps.claim.outputs.vid }}
+          BILI_TID: ${{ vars.BILI_TID }}
+          BILI_TAGS: ${{ vars.BILI_TAGS }}
+          ZIP_DIR: out
+        run: |
+          set -uo pipefail
+          # 安装 biliup-rs
+          wget -q https://github.com/biliup/biliup-rs/releases/download/$BILI_UP_VER/biliupR-$BILI_UP_VER-x86_64-linux.tar.xz
+          tar xf biliupR-$BILI_UP_VER-x86_64-linux.tar.xz
+          sudo mv biliupR-$BILI_UP_VER-x86_64-linux/biliup /usr/local/bin/
+          sudo chmod +x /usr/local/bin/biliup
+
+          # 产物兜底：本次 kernel 没有新 zip（此前已处理过）时，从数据集补拉
+          if [ ! -f "out/$VID.zip" ]; then
+            echo "out/ 缺 $VID.zip，从产物数据集补拉..."
+            kaggle datasets download "$OUTPUTS_SLUG" -f "$VID.zip" -p out
+            # Kaggle 单文件下载可能再包一层 zip，归一化
+            if [ -f "out/$VID.zip.zip" ]; then
+              unzip -o -q "out/$VID.zip.zip" -d out && rm "out/$VID.zip.zip"
+            fi
+          fi
+
+          python .github/script/publish_bilibili.py
+
+      - name: 失败兜底：把已认领行标记「失败」
+        if: failure() && steps.claim.outputs.claimed == 'true'
+        run: python .github/script/sheet_task.py mark-failed
 
       - name: 上传日志（失败时排查用）
         if: failure()
