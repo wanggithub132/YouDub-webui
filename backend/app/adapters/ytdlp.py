@@ -27,8 +27,8 @@ FORMAT_CANDIDATES = (
 
 # 下载健全性阈值：低于该值视为残缺/截断文件，
 # 防止 yt-dlp "假成功"（仅写出几 KB 的错误页/空壳文件）进入后续阶段
-MIN_VIDEO_SIZE_BYTES = 512 * 1024
-MIN_VIDEO_DURATION_SECONDS = 10
+MIN_VIDEO_SIZE_BYTES = 5 * 1024 * 1024
+MIN_VIDEO_DURATION_SECONDS = 30
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
