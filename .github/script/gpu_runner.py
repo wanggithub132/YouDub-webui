@@ -181,7 +181,7 @@ def main() -> int:
     if BATCH_SIZE.strip().isdigit():
         batch = max(1, int(BATCH_SIZE.strip()))
 
-    # ── 1. 克隆仓库 + demucs 子模块 ──
+    # ── 1. 克隆仓库 + demucs/dapang 子模块 ──
     BUILD.mkdir(parents=True, exist_ok=True)
     if not REPO.exists():
         sh(f"git clone --depth=1 https://github.com/wanggithub132/YouDub-webui.git {REPO}")
@@ -189,6 +189,11 @@ def main() -> int:
     if not (demucs / "demucs" / "api.py").exists():
         shutil.rmtree(demucs, ignore_errors=True)
         sh(f"git clone --depth=1 https://github.com/facebookresearch/demucs.git {demucs}")
+    # 下载能力（YoutubeDownloader）依赖 dapang 子模块，必须同步 clone
+    dapang = REPO / "submodule" / "dapang"
+    if not (dapang / "youtube_downloader.py").exists():
+        shutil.rmtree(dapang, ignore_errors=True)
+        sh(f"git clone --depth=1 https://github.com/wanggithub132/dapang.git {dapang}")
 
     # ── 2. 系统依赖：ffmpeg + deno（yt-dlp EJS 求解器需要）──
     sh("apt-get update -qq && apt-get install -y -qq ffmpeg")
@@ -202,17 +207,10 @@ def main() -> int:
        "--index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3")
     sh('pip install -q -U "yt-dlp[default]" yt-dlp-ejs 2>&1 | tail -3')
 
-    # ── 4. 热改 ytdlp.py：JS 运行时 node → deno ──
-    ytdlp_py = REPO / "backend" / "app" / "adapters" / "ytdlp.py"
-    ytdlp_py.write_text(
-        ytdlp_py.read_text(encoding="utf-8").replace(
-            '"js_runtimes": {"node": {}}', '"js_runtimes": {"deno": {}}'),
-        encoding="utf-8")
-
-    # ── 5. 恢复模型缓存 ──
+    # ── 4. 恢复模型缓存 ──
     restore_model_cache()
 
-    # ── 6. cookie + .env（.env 必须纯 ASCII）──
+    # ── 5. cookie + .env（.env 必须纯 ASCII）──
     if YOUTUBE_COOKIE_B64.strip() and not YOUTUBE_COOKIE_B64.startswith("__"):
         cookie = base64.b64decode(YOUTUBE_COOKIE_B64).decode("utf-8")
         cookie_dir = REPO / "data" / "cookies"
@@ -228,7 +226,7 @@ def main() -> int:
         f"OPENAI_API_KEY={OPENAI_API_KEY}\n"
         f"OPENAI_MODEL=deepseek-v4-flash\n")
 
-    # ── 7. 组装待处理清单：视频源 - 已完成 = 待跑，取前 batch 个 ──
+    # ── 6. 组装待处理清单：视频源 - 已完成 = 待跑，取前 batch 个 ──
     all_urls = read_sources()
     done = done_vids()
     print(f"\n视频源共 {len(all_urls)} 条，已完成 {len(done)} 个", flush=True)
@@ -241,7 +239,7 @@ def main() -> int:
 
     print(f"本批处理 {len(todo)} 个: " + ", ".join(v for _, v in todo), flush=True)
 
-    # ── 8. 环境已就绪，循环跑（子进程隔离；TTS 阶段自动多卡）──
+    # ── 7. 环境已就绪，循环跑（子进程隔离；TTS 阶段自动多卡）──
     env = dict(os.environ)
     env["TORCHDYNAMO_DISABLE"] = "1"  # T4 不支持 bfloat16 编译
     env["OPENAI_API_KEY"] = OPENAI_API_KEY

@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
-
-import time
 
 import requests
 import yt_dlp
@@ -17,13 +17,26 @@ from ..sanitize import sanitize_text
 from ..sources import SourceConfig
 from ..youtube import extract_video_id, validate_video_url
 
+# 下载能力复用 dapang 子模块的 YoutubeDownloader（EJS 挑战/deno 注入/失败分类/
+# 完整性校验都封装在那边），本模块只保留元数据获取、路径规划与调用胶水。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "submodule" / "dapang"))
 
-FORMAT_CANDIDATES = (
-    "bestvideo[height<=1080]+bestaudio/best",
-    "bestvideo+bestaudio/best",
-    "bv*+ba/b",
-    "best",
-)
+try:
+    from youtube_downloader import YoutubeDownloader  # noqa: E402
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError(
+        "submodule/dapang 缺失（下载能力依赖）：先执行 git submodule update --init --recursive"
+    ) from exc
+
+
+# 下载格式候选链：1080p 高清优先（允许 vp9/webm，排除 av01 便于 ffmpeg 重编码），
+# mp4 兼容兜底，最后 best。与 dapang DEFAULT_FORMATS 保持一致。
+YOU_DUB_FORMATS = {
+    "1080": "bestvideo[height<=1080][vcodec!*=av01]+bestaudio/best",
+    "mp4": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+    "best": "best",
+}
 
 # 下载健全性阈值：低于该值视为残缺/截断文件，
 # 防止 yt-dlp "假成功"（仅写出几 KB 的错误页/空壳文件）进入后续阶段
@@ -73,13 +86,11 @@ def _ydl_base(source: SourceConfig, proxy_port: str = "") -> dict[str, Any]:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "js_runtimes": {"node": {}},
+        "js_runtimes": {"node": {}, "deno": {}},
     }
-    if source.name == "youtube":
-        # yt-dlp 官方警告：对 YouTube 覆盖 User-Agent 会导致格式失效；
-        # 登录 cookie 会触发 SABR-only 响应，加 android 客户端兜底
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
-    else:
+    # 不再显式覆盖 player_client：yt-dlp 默认多客户端自动 fallback 可拿全格式；
+    # 实测显式 android 会把格式锁死在 360p，web 单用常返回空响应（2026-07）。
+    if source.name != "youtube":
         opts["http_headers"] = {"User-Agent": DEFAULT_USER_AGENT}
     cookie_path = source.cookie_path
     if cookie_path:
@@ -104,7 +115,6 @@ def _session_path(workfolder: Path, info: dict[str, Any]) -> Path:
 
 def _is_format_unavailable(exc: Exception) -> bool:
     return "Requested format is not available" in str(exc)
-
 
 def _remove_partial_outputs(video_file: Path) -> None:
     for candidate in video_file.parent.glob(f"{video_file.name}*"):
@@ -144,30 +154,40 @@ def _is_valid_video(video_file: Path) -> bool:
     return duration is not None and duration >= MIN_VIDEO_DURATION_SECONDS
 
 
+def _build_downloader(source: SourceConfig, proxy_port: str = "") -> YoutubeDownloader:
+    """按 SourceConfig 组装 dapang 下载器（proxy 三态：指定/自动/显式禁用）。"""
+    proxy: str | None = None
+    if source.use_proxy:
+        proxy = _proxy_url(proxy_port) or None  # 指定端口，否则自动识别环境变量
+    else:
+        proxy = ""  # 显式禁用（忽略环境变量）
+    return YoutubeDownloader(
+        cookies_file=str(source.cookie_path) if source.cookie_path else "",
+        proxy=proxy,
+        extractor_retries=3,
+        timeout=1800,
+        fragment_retries=10,
+        retries=10,
+        ffprobe_path=ffprobe_binary(),
+        min_size_mb=MIN_VIDEO_SIZE_BYTES // (1024 * 1024),
+        min_duration_s=MIN_VIDEO_DURATION_SECONDS,
+        log=lambda msg: print(msg, flush=True),
+    )
+
+
 def _download_with_format_candidates(
     url: str, video_file: Path, source: SourceConfig, proxy_port: str
 ) -> None:
-    last_error: Exception | None = None
-    for format_selector in FORMAT_CANDIDATES:
-        download_opts = {
-            **_ydl_base(source, proxy_port),
-            "format": format_selector,
-            "merge_output_format": "mp4",
-            "outtmpl": str(video_file),
-            "retries": 10,
-            "fragment_retries": 10,
-        }
-        try:
-            with yt_dlp.YoutubeDL(download_opts) as ydl:
-                ydl.download([url])
-            return
-        except Exception as exc:
-            last_error = exc
-            _remove_partial_outputs(video_file)
-            if not _is_format_unavailable(exc):
-                continue
-    if last_error:
-        raise last_error
+    """复用 dapang YoutubeDownloader（CLI）按候选链下载，产物统一为 video_source.mp4。"""
+    out_prefix = str(video_file.with_suffix(""))
+    ext = _build_downloader(source, proxy_port).download_with_fallback(
+        url, out_prefix, formats=YOU_DUB_FORMATS
+    )
+    if ext is None:
+        raise RuntimeError(f"All download format candidates failed: {url}")
+    produced = Path(f"{out_prefix}.{ext}")
+    if produced != video_file:
+        produced.replace(video_file)
 
 
 def download_video(
