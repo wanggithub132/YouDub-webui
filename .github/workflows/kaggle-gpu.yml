@@ -73,8 +73,8 @@ jobs:
         with:
           submodules: true
 
-      - name: 安装依赖（kaggle CLI + dapang 表格/Gist 能力所需）
-        run: pip install -q kaggle gspread oauth2client requests
+      - name: 安装依赖（kaggle CLI + dapang 表格/Gist/封面能力所需）
+        run: pip install -q kaggle gspread oauth2client requests curl_cffi==0.16.0
 
       - name: 从表格认领一条任务（读取即写「处理中」）
         id: claim

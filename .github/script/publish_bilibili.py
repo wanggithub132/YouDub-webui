@@ -21,6 +21,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import requests
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "submodule" / "dapang"))
 
@@ -52,6 +54,43 @@ def extract_final_video(zip_dir, vid):
             log(f"解压完成：{p}（{p.stat().st_size >> 20} MB）")
             return p
     raise FileNotFoundError(f"{zip_path} 内没有 video_final.mp4")
+
+
+def fetch_cover(vid):
+    """从 metadata/ytdlp_info.json 读封面 URL 并下载（转码交给 dapang upload_cover 内部处理）。
+
+    任一环节失败仅告警并返回 None——封面是锦上添花，绝不阻塞投稿。
+    封面文件放在 EXTRACT_DIR/vid/ 下，finally 的 rmtree 会自动清理。
+    """
+    info_file = EXTRACT_DIR / vid / "metadata" / "ytdlp_info.json"
+    if not info_file.is_file():
+        log("[WARN] 无 ytdlp_info.json，跳过封面")
+        return None
+    try:
+        info = json.loads(info_file.read_text(encoding="utf8"))
+    except (OSError, ValueError):
+        log("[WARN] ytdlp_info.json 解析失败，跳过封面")
+        return None
+    thumb = str(info.get("thumbnail") or "")
+    if not thumb:
+        thumbs = info.get("thumbnails") or []
+        if thumbs:
+            thumb = str((thumbs[-1] or {}).get("url") or "")
+    if not thumb:
+        log("[WARN] 无封面 URL，跳过封面")
+        return None
+    cover = EXTRACT_DIR / vid / "cover.jpg"
+    try:
+        resp = requests.get(
+            thumb, timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"})
+        resp.raise_for_status()
+        cover.write_bytes(resp.content)
+        log(f"封面已下载：{thumb}（{len(resp.content) >> 10} KB）")
+        return cover
+    except Exception as exc:
+        log(f"[WARN] 封面下载失败（{exc}），跳过封面")
+        return None
 
 
 def renew_and_sync_cookie(store):
@@ -91,6 +130,7 @@ def main():
         tid = ov.get("tid") or os.environ.get("BILI_TID", "")
         if not tid:
             raise SystemExit("tid 缺失：表格「分区」列为空且未配 BILI_TID 变量")
+        cover = fetch_cover(vid)
         ret = BilibiliUploader(log=log).upload(
             str(video),
             title=ov.get("title") or task["title"],
@@ -100,6 +140,7 @@ def main():
             copyright=ov.get("copyright"),
             desc=ov.get("desc"),
             dtime=ov.get("dtime"),
+            cover=str(cover) if cover else None,
         )
         if ret.get("code") != 0:
             raise RuntimeError(f"B站返回异常：{ret}")
