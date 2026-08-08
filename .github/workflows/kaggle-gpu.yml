@@ -220,6 +220,8 @@ jobs:
           BILI_TID: ${{ vars.BILI_TID }}
           BILI_TAGS: ${{ vars.BILI_TAGS }}
           ZIP_DIR: out
+          DOUYIN_ACCOUNT: ${{ vars.DOUYIN_ACCOUNT }}
+          DOUYIN_DIR: .sau
         run: |
           set -uo pipefail
           # 安装 biliup-rs
@@ -227,6 +229,22 @@ jobs:
           tar xf biliupR-$BILI_UP_VER-x86_64-linux.tar.xz
           sudo mv biliupR-$BILI_UP_VER-x86_64-linux/biliup /usr/local/bin/
           sudo chmod +x /usr/local/bin/biliup
+
+          # 抖音上传环境（social-auto-upload，可选能力：任一步失败只告警，不阻断 B站投稿）
+          if [ -n "$DOUYIN_ACCOUNT" ]; then
+            git clone --depth 1 https://github.com/dreammis/social-auto-upload.git .sau \
+              || echo "[WARN] SAU clone 失败，跳过抖音推送"
+            pip install -e .sau \
+              || echo "[WARN] SAU 依赖安装失败，跳过抖音推送"
+            cp .sau/conf.example.py .sau/conf.py 2>/dev/null || true
+            # chromium 必须装当前用户缓存（sudo 会重置 HOME）；系统依赖用 sudo env PATH 装
+            sudo env "PATH=$PATH" patchright install-deps chromium \
+              || echo "[WARN] chromium 系统依赖安装失败，跳过抖音推送"
+            patchright install chromium \
+              || echo "[WARN] chromium 安装失败，跳过抖音推送"
+          else
+            echo "未配置 DOUYIN_ACCOUNT，跳过抖音环境安装"
+          fi
 
           # 产物兜底：本次 kernel 没有新 zip（此前已处理过）时，从数据集补拉
           if [ ! -f "out/$VID.zip" ]; then
