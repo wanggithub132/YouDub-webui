@@ -1,9 +1,9 @@
 name: YouDub Kaggle GPU（单条认领）
 
 on:
-  # 定时：每 6 小时消化一条表格任务（天然给 B站投稿限流）
+  # 定时：每天 3 次消化表格任务（北京 10/17/20 点，比 dapang 早 1 小时，避开凌晨）
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 2,9,12 * * *"
   # 手动：留空走表格认领；填单条链接则只处理不投稿（调试用，不动表格）
   workflow_dispatch:
     inputs:
