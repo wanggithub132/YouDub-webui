@@ -220,7 +220,7 @@ jobs:
           BILI_TID: ${{ vars.BILI_TID }}
           BILI_TAGS: ${{ vars.BILI_TAGS }}
           ZIP_DIR: out
-          DOUYIN_ACCOUNT: ${{ vars.DOUYIN_ACCOUNT }}
+          DOUYIN_ACCOUNT: ${{ secrets.DOUYIN_ACCOUNT }}
           DOUYIN_DIR: .sau
         run: |
           set -uo pipefail
