@@ -237,8 +237,8 @@ jobs:
             pip install -e .sau \
               || echo "[WARN] SAU 依赖安装失败，跳过抖音推送"
             cp .sau/conf.example.py .sau/conf.py 2>/dev/null || true
-            # chromium 必须装当前用户缓存（sudo 会重置 HOME）；系统依赖用 sudo env PATH 装
-            sudo env "PATH=$PATH" patchright install-deps chromium \
+            # chromium 必须装当前用户缓存（sudo 会重置 HOME，须显式传回，否则 patchright 找不到 user-site 模块）；系统依赖用 sudo env PATH 装
+            sudo env "PATH=$PATH" "HOME=$HOME" patchright install-deps chromium \
               || echo "[WARN] chromium 系统依赖安装失败，跳过抖音推送"
             patchright install chromium \
               || echo "[WARN] chromium 安装失败，跳过抖音推送"

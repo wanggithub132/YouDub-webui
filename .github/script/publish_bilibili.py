@@ -180,6 +180,14 @@ def push_douyin(video, *, title, tags, desc, store):
             log("抖音 cookie 已回写 Gist（保持登录态）")
     except Exception as exc:
         log(f"[WARN] 抖音推送失败（{exc}），不影响 B站结果")
+        # 诊断：尝试启动 chromium，捕获缺系统库等根因（失败信息里能看到缺失的 .so）
+        try:
+            from patchright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                p.chromium.launch(headless=True)
+            log("诊断：chromium 可正常启动，失败可能来自登录/风控")
+        except Exception as e2:
+            log(f"[WARN] 诊断：chromium 启动失败（{e2}）")
     finally:
         stop_event.set()
 
