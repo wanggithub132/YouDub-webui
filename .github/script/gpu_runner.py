@@ -257,7 +257,7 @@ def main() -> int:
         except Exception as exc:  # 单个视频崩溃不影响后续
             print(f"!! [{url}] 异常: {exc}", flush=True)
             rc = 1
-        produced += package_finished(done | {v for v in ok})
+        produced += package_finished(set(ok))
         (ok if rc == 0 else fail).append(vid)
 
     # ── 9. 汇总结果 ──
