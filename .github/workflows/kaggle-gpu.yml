@@ -82,26 +82,7 @@ jobs:
           INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
         run: python .github/script/sheet_task.py claim
 
-      - name: 确保产物数据集存在（去重依据 + 产物归档）
-        if: steps.claim.outputs.has_video == 'true'
-        run: |
-          set -uo pipefail
-          if kaggle datasets status "$OUTPUTS_SLUG" 2>/dev/null | grep -qi ready; then
-            echo "产物数据集已存在"
-          else
-            echo "首次运行：创建空的产物数据集 $OUTPUTS_SLUG"
-            rm -rf outds && mkdir -p outds
-            echo "YouDub 产物归档（每个视频一个 {vid}.zip）" > outds/README.txt
-            python3 - <<EOF
-          import json, os, pathlib
-          user = os.environ["KAGGLE_USERNAME"]
-          meta = {"title": "youdub-outputs", "id": f"{user}/youdub-outputs",
-                  "licenses": [{"name": "CC0-1.0"}]}
-          pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
-          EOF
-            kaggle datasets create -p outds --dir-mode zip || true
-            sleep 15
-          fi
+
 
       - name: 组装 kernel（注入单条链接/密钥/cookie + 挂载两个数据集）
         if: steps.claim.outputs.has_video == 'true'
@@ -139,8 +120,8 @@ jobs:
               # 锁定 T4 加速器，避免抽到 P100（抽卡重试仍保留作兜底）
               "machine_shape": "NvidiaTeslaT4",
               "enable_internet": True,
-              # 关键：挂载模型缓存 + 产物数据集（产物用于去重）
-              "dataset_sources": [f"{user}/youdub-models", f"{user}/youdub-outputs"],
+              # 关键：挂载模型缓存（用于加速 TTS/Whisper）
+              "dataset_sources": [f"{user}/youdub-models"],
               "competition_sources": [],
               "kernel_sources": [],
           }
@@ -191,27 +172,7 @@ jobs:
           echo "❌ 连续 $MAX_ATTEMPTS 次未抽到 T4，放弃（下次定时会自动重试）"
           exit 1
 
-      - name: 归档产物到数据集（供下次去重 + 长期留存）
-        if: success() && steps.claim.outputs.has_video == 'true'
-        run: |
-          set -uo pipefail
-          shopt -s nullglob
-          NEW_ZIPS=(out/*.zip)
-          if [ ${#NEW_ZIPS[@]} -eq 0 ]; then
-            echo "本次无新产物（可能此前已处理过），跳过归档"; exit 0
-          fi
-          rm -rf outds && mkdir -p outds
-          kaggle datasets download "$OUTPUTS_SLUG" -p outds --unzip || true
-          rm -f outds/dataset-metadata.json
-          cp out/*.zip outds/ || true
-          python3 - <<EOF
-          import json, os, pathlib
-          user = os.environ["KAGGLE_USERNAME"]
-          meta = {"title": "youdub-outputs", "id": f"{user}/youdub-outputs",
-                  "licenses": [{"name": "CC0-1.0"}]}
-          pathlib.Path("outds/dataset-metadata.json").write_text(json.dumps(meta, indent=2))
-          EOF
-          kaggle datasets version -p outds -m "add $(ls out/*.zip | wc -l) zips" --dir-mode zip --delete-old-versions
+
 
       - name: 投稿到 B站（仅表格认领模式）
         if: success() && steps.claim.outputs.claimed == 'true'
@@ -249,14 +210,11 @@ jobs:
             echo "未配置 DOUYIN_ACCOUNT，跳过抖音环境安装"
           fi
 
-          # 产物兜底：本次 kernel 没有新 zip（此前已处理过）时，从数据集补拉
+          # 产物兜底：本次 kernel 没有新 zip（此前已处理过）时，暂不支持归档恢复
+          #（方案A已删除归档步骤，产物只在 /kaggle/working 存在）
           if [ ! -f "out/$VID.zip" ]; then
-            echo "out/ 缺 $VID.zip，从产物数据集补拉..."
-            kaggle datasets download "$OUTPUTS_SLUG" -f "$VID.zip" -p out
-            # Kaggle 单文件下载可能再包一层 zip，归一化
-            if [ -f "out/$VID.zip.zip" ]; then
-              unzip -o -q "out/$VID.zip.zip" -d out && rm "out/$VID.zip.zip"
-            fi
+            echo "[ERROR] out/ 缺 $VID.zip，且数据集归档已删除，无法恢复"
+            exit 1
           fi
 
           python .github/script/publish_bilibili.py

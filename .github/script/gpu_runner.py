@@ -1,13 +1,10 @@
 """
-YouDub GPU Runner — 由 GitHub Actions 推送到 Kaggle 执行（批量版）
+"""YouDub GPU Runner — 由 GitHub Actions 推送到 Kaggle 执行（单条认领模式）
 ================================================================
 流程：GPU 门禁(必须 T4) → 克隆仓库 → 装依赖 → 恢复模型缓存
-     → 读视频源(Google 表格 CSV / 单条 URL) → 产物去重
-     → 环境只搭一次，循环跑 N 个视频
-     → 每个视频打包 {vid}.zip 到 /kaggle/working
+     → 处理认领的视频 → 打包 {vid}.zip 到 /kaggle/working
 
-去重原理：/kaggle/input 下所有已挂载的 *.zip 文件名(stem) = 已完成的 vid。
-         youdub-outputs 数据集挂进来后，跑过的视频自动跳过。
+去重：由 Google 表格认领机制保证（只有状态列为空的才会被认领）。
 
 结果协议：/kaggle/working/RESULT.txt 首行为
   SUCCESS / GPU_NOT_T4 / FAILED
@@ -91,13 +88,12 @@ def read_sources() -> list[str]:
 
 
 def done_vids() -> set[str]:
-    """已完成的 vid 集合 = /kaggle/input 下所有已挂载 zip 的文件名 stem。"""
-    done = set()
-    inp = Path("/kaggle/input")
-    if inp.exists():
-        for z in inp.rglob("*.zip"):
-            done.add(z.stem)
-    return done
+    """已完成的 vid 集合。
+    
+    注：单条认领模式下，去重由表格认领机制保证，此函数返回空集合。
+    历史逻辑（批量模式）依赖 Kaggle 数据集挂载，已废弃。
+    """
+    return set()
 
 
 def restore_model_cache() -> None:
@@ -226,15 +222,17 @@ def main() -> int:
         f"OPENAI_API_KEY={OPENAI_API_KEY}\n"
         f"OPENAI_MODEL=deepseek-v4-flash\n")
 
-    # ── 6. 组装待处理清单：视频源 - 已完成 = 待跑，取前 batch 个 ──
+    # ── 6. 组装待处理清单：单条认领模式，从环境变量读取
     all_urls = read_sources()
-    done = done_vids()
-    print(f"\n视频源共 {len(all_urls)} 条，已完成 {len(done)} 个", flush=True)
-    pending = [(u, extract_vid(u)) for u in all_urls if extract_vid(u) not in done]
-    todo = pending[:batch]
+    if not all_urls:
+        write_result("FAILED", "无视频源")
+        return 0
+    
+    print(f"\n视频源: {all_urls[0]}", flush=True)
+    todo = [(all_urls[0], extract_vid(all_urls[0]))]
 
     if not todo:
-        write_result("SUCCESS", f"无待处理视频（源 {len(all_urls)} / 已完成 {len(done)}）")
+        write_result("FAILED", "无待处理视频")
         return 0
 
     print(f"本批处理 {len(todo)} 个: " + ", ".join(v for _, v in todo), flush=True)
