@@ -135,6 +135,9 @@ class PipelineRunner:
 
     def log(self, message: str) -> None:
         _write_log(self.task_id, message)
+        # 同步一份到 stdout：容器/CI（如 Kaggle kernel）后续只能拿到进程输出，
+        # 不回显的话阶段耗时等排查信息会全部丢在日志文件里看不到
+        print(message, flush=True)
 
     def stage_message(self, stage: str, message: str) -> None:
         database.update_stage(self.task_id, stage, last_message=message)
@@ -203,16 +206,18 @@ class PipelineRunner:
             error_message=None,
         )
         self.stage_message(stage, "Started")
+        started = monotonic()
         self._stage_handlers[stage](database.get_task(self.task_id))
+        elapsed = monotonic() - started
         database.update_stage(
             self.task_id,
             stage,
             status="succeeded",
             progress=100,
             completed_at=database.now_iso(),
-            last_message="Completed",
+            last_message=f"Completed in {elapsed:.1f}s",
         )
-        self.log(f"[{stage}] Completed")
+        self.log(f"[{stage}] Completed in {elapsed:.1f}s")
 
     def _restore_cached_stage(self, stage: str, task: dict | None) -> None:
         if not task:

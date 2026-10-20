@@ -11,6 +11,7 @@ GitHub Actions 依据它决定：成功收工 / 重推抽卡 / 报错终止。
 """
 
 import base64
+import contextlib
 import csv
 import io
 import os
@@ -33,6 +34,59 @@ WORKING = Path("/kaggle/working")          # 只放最终产物（= kernel Outpu
 BUILD = Path("/tmp/youdub")                # 仓库+中间产物，不进 Output
 REPO = BUILD / "YouDub-webui"
 OUTPUT = BUILD / "output"
+
+# 阶段耗时记录：((名称, 秒), ...)，结束时汇总进 RESULT.txt 与 kernel 日志
+_STAGE_COST: list[tuple[str, float]] = []
+
+
+@contextlib.contextmanager
+def timed(label: str):
+    """记录一个阶段的墙钟耗时，结束（含异常）时打印一行，便于定位慢点。"""
+    started = time.monotonic()
+    print(f"\n[TIMER] >>> {label}", flush=True)
+    try:
+        yield
+    finally:
+        cost = time.monotonic() - started
+        _STAGE_COST.append((label, cost))
+        print(f"[TIMER] <<< {label} = {cost / 60:.1f} min", flush=True)
+
+
+def dump_timings() -> str:
+    """打印并返回阶段耗时汇总（单行，可直接写进 RESULT.txt 第二行）。"""
+    if not _STAGE_COST:
+        return ""
+    print("\n===== 阶段耗时汇总（分钟）=====", flush=True)
+    for label, cost in _STAGE_COST:
+        print(f"  {label:26} {cost / 60:8.1f}", flush=True)
+    return "TIMINGS: " + " | ".join(f"{label}={cost / 60:.1f}min" for label, cost in _STAGE_COST)
+
+
+def torch_ready() -> bool:
+    """判断预装 torch 能否直接用于 T4：CUDA 12.x 构建 + torchaudio 可导入。
+
+    Kaggle T4 镜像已预装 cu124 的 torch，满足条件时跳过 2-3GB 的强制重装，
+    避免网络抖动把这一步拖成 1-2 小时。设 FORCE_TORCH_REINSTALL=1 可强制重装。
+    """
+    if os.getenv("FORCE_TORCH_REINSTALL", "").strip().lower() not in ("", "0", "false"):
+        print("FORCE_TORCH_REINSTALL 已设置，强制重装 torch", flush=True)
+        return False
+    probe = (
+        "import torch, torchaudio; "
+        "assert str(torch.version.cuda).startswith('12'), 'cuda ' + str(torch.version.cuda); "
+        "assert torch.cuda.is_available(), 'cuda unavailable'; "
+        "print('torch ' + torch.__version__ + ' / torchaudio ' + torchaudio.__version__ "
+        "+ ' / cuda ' + str(torch.version.cuda))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        print("torch 探测超时，按不满足处理", flush=True)
+        return False
+    print((result.stdout or "").strip() or (result.stderr or "").strip(), flush=True)
+    return result.returncode == 0
 
 
 def write_result(tag: str, extra: str = "") -> None:
@@ -159,10 +213,15 @@ def run_one(url: str, env: dict) -> int:
 
 def main() -> int:
     # ── 0. GPU 门禁：用预装 torch 秒查，不是 T4 立刻退出省时间 ──
-    import torch
+    gpu = "none"
+    with timed("gpu-gate"):
+        import torch
 
-    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
-    print(f"分到的 GPU: {gpu} × {torch.cuda.device_count()}", flush=True)
+        if torch.cuda.is_available():
+            gpu = torch.cuda.get_device_name(0)
+            print(f"分到的 GPU: {gpu} × {torch.cuda.device_count()}", flush=True)
+        else:
+            print("分到的 GPU: none（无 CUDA 设备）", flush=True)
     if "T4" not in gpu:
         write_result("GPU_NOT_T4", gpu)
         return 0  # 正常退出，让 Actions 重推抽卡
@@ -178,32 +237,48 @@ def main() -> int:
 
     # ── 1. 克隆仓库 + demucs/dapang 子模块 ──
     BUILD.mkdir(parents=True, exist_ok=True)
-    if not REPO.exists():
-        sh(f"git clone --depth=1 https://github.com/wanggithub132/YouDub-webui.git {REPO}")
-    demucs = REPO / "submodule" / "demucs"
-    if not (demucs / "demucs" / "api.py").exists():
-        shutil.rmtree(demucs, ignore_errors=True)
-        sh(f"git clone --depth=1 https://github.com/facebookresearch/demucs.git {demucs}")
-    # 下载能力（YoutubeDownloader）依赖 dapang 子模块，必须同步 clone
-    dapang = REPO / "submodule" / "dapang"
-    if not (dapang / "youtube_downloader.py").exists():
-        shutil.rmtree(dapang, ignore_errors=True)
-        sh(f"git clone --depth=1 https://github.com/wanggithub132/dapang.git {dapang}")
+    with timed("clone-repos"):
+        if not REPO.exists():
+            sh(f"git clone --depth=1 https://github.com/wanggithub132/YouDub-webui.git {REPO}")
+        demucs = REPO / "submodule" / "demucs"
+        if not (demucs / "demucs" / "api.py").exists():
+            shutil.rmtree(demucs, ignore_errors=True)
+            sh(f"git clone --depth=1 https://github.com/facebookresearch/demucs.git {demucs}")
+        # 下载能力（YoutubeDownloader）依赖 dapang 子模块，必须同步 clone
+        dapang = REPO / "submodule" / "dapang"
+        if not (dapang / "youtube_downloader.py").exists():
+            shutil.rmtree(dapang, ignore_errors=True)
+            sh(f"git clone --depth=1 https://github.com/wanggithub132/dapang.git {dapang}")
 
     # ── 2. 系统依赖：ffmpeg + deno（yt-dlp EJS 求解器需要）──
-    sh("apt-get update -qq && apt-get install -y -qq ffmpeg")
-    sh("curl -fsSL https://deno.land/install.sh | sh -s -- -y")
-    deno = Path.home() / ".deno" / "bin" / "deno"
-    sh(f"ln -sf {deno} /usr/local/bin/deno && deno --version")
+    with timed("apt-ffmpeg"):
+        sh("apt-get update -qq && apt-get install -y -qq ffmpeg")
+    with timed("install-deno"):
+        sh("curl -fsSL https://deno.land/install.sh | sh -s -- -y")
+        deno = Path.home() / ".deno" / "bin" / "deno"
+        sh(f"ln -sf {deno} /usr/local/bin/deno && deno --version")
 
     # ── 3. Python 依赖（cu124 torch 为已验证组合）──
-    sh(f"cd {REPO} && pip install -q -r requirements.txt 2>&1 | tail -3")
-    sh("pip install -q --force-reinstall torch torchaudio "
-       "--index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3")
-    sh('pip install -q -U "yt-dlp[default]" yt-dlp-ejs 2>&1 | tail -3')
+    # pip 步骤单独放宽到 90 分钟：默认 30 分钟超时会直接抛异常，
+    # 导致 RESULT.txt 写不出来（Actions 侧只能看到 NO_RESULT）
+    with timed("pip-requirements"):
+        sh(f"cd {REPO} && pip install -q -r requirements.txt 2>&1 | tail -3", timeout=5400)
+    # Kaggle T4 镜像已预装 cu124 的 torch：满足要求就跳过 2-3GB 的强制重装，
+    # 避免网络抖动把这一步拖成 1-2 小时（FORCE_TORCH_REINSTALL=1 可强制重装）
+    if torch_ready():
+        torch_mode = "reuse(preinstalled)"
+        print("预装 torch 满足要求，跳过 cu124 重装", flush=True)
+    else:
+        torch_mode = "reinstalled-cu124"
+        with timed("pip-torch-cu124"):
+            sh("pip install -q --force-reinstall torch torchaudio "
+               "--index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3", timeout=5400)
+    with timed("pip-ytdlp"):
+        sh('pip install -q -U "yt-dlp[default]" yt-dlp-ejs 2>&1 | tail -3', timeout=1800)
 
     # ── 4. 恢复模型缓存 ──
-    restore_model_cache()
+    with timed("restore-model-cache"):
+        restore_model_cache()
 
     # ── 5. cookie + .env（.env 必须纯 ASCII）──
     if YOUTUBE_COOKIE_B64.strip() and not YOUTUBE_COOKIE_B64.startswith("__"):
@@ -253,26 +328,36 @@ def main() -> int:
             print(f"⏰ 时间预算已用尽，跳过: {vid}（下次定时会自动补跑）", flush=True)
             continue
         try:
-            rc = run_one(url, env)
+            with timed(f"pipeline-{vid}"):
+                rc = run_one(url, env)
         except Exception as exc:  # 单个视频崩溃不影响后续
             print(f"!! [{url}] 异常: {exc}", flush=True)
             rc = 1
-        produced += package_finished(set(ok))
+        with timed("package-zip"):
+            produced += package_finished(set(ok))
         (ok if rc == 0 else fail).append(vid)
 
-    # ── 9. 汇总结果 ──
+    # ── 9. 汇总结果（第二行起写阶段耗时，head -1 仍取状态）──
     summary = f"成功 {len(ok)} [{', '.join(ok)}] / 失败 {len(fail)} [{', '.join(fail)}]"
     if skipped:
         summary += f" / 超时顺延 {len(skipped)} [{', '.join(skipped)}]"
     print("\n" + summary, flush=True)
+    timings = dump_timings()
+    tail = ("\n" + timings if timings else "") + f"\nTORCH: {torch_mode}"
     if produced and not fail:
-        write_result("SUCCESS", summary)
+        write_result("SUCCESS", summary + tail)
     elif produced:
-        write_result("SUCCESS", summary + "（部分失败，成功的已打包）")
+        write_result("SUCCESS", summary + "（部分失败，成功的已打包）" + tail)
     else:
-        write_result("FAILED", summary)
+        write_result("FAILED", summary + tail)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        dump_timings()  # 崩溃时也把慢点打出来，便于下次定位
+        raise
